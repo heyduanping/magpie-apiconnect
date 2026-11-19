@@ -1,0 +1,29 @@
+{
+  "name": "magpie-apiconnect-quota",
+  "version": "0.2.0",
+  "description": "APIConnect subscription quotas, wallet balance and Anthropic models in one Magpie provider",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": [
+    "index.mjs"
+  ],
+  "keywords": [
+    "magpie-plugin",
+    "opencode-plugin",
+    "apiconnect",
+    "anthropic"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/heyduanping/magpie-apiconnect.git"
+  },
+  "magpie": {
+    "name": "APIConnect",
+    "icon": "https://apiconnect.lol/logo.svg",
+    "summary": {
+      "zh": "在同一个供应商中调用 APIConnect 模型，查看订阅余量和钱包余额。",
+      "en": "Use APIConnect models and view subscription allowances and wallet balance in one provider."
+    }
+  }
+}
