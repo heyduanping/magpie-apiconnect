@@ -3,6 +3,7 @@ const modelBase = "https://apiconnect.lol/v1";
 const anthropic = "@ai-sdk/anthropic";
 const site = "https://apiconnect.lol";
 const day = 86400000;
+const pluginVersion = "0.3.0";
 
 async function request(path, { bearer, body, signal } = {}) {
   let response;
@@ -39,7 +40,7 @@ async function request(path, { bearer, body, signal } = {}) {
 }
 
 function session(data) {
-  if (data?.requires_2fa) throw new Error("该账号启用了二次验证。请在官网「我的订阅 → 查看可使用套餐的 Key」选择可直接查询订阅的 Key。");
+  if (data?.requires_2fa) throw new Error("该账号启用了二次验证。请使用 API Key 登录；需要查看其他订阅时可打开官网「我的订阅」。");
   if (!data?.access_token || !data.refresh_token || !(data.expires_in > 0)) {
     throw new Error("APIConnect 未返回可续期的登录信息。");
   }
@@ -127,17 +128,69 @@ async function sendModel(input, init, getAuth) {
   for (const name of ["authorization", "cookie", "proxy-authorization", "x-goog-api-key", "x-api-key"]) headers.delete(name);
   headers.set("x-api-key", modelKey(await getAuth()));
   if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
-  return fetch(input, { ...init, headers, redirect: "error" });
+  let response;
+  try {
+    response = await fetch(input, { ...init, headers, redirect: "error" });
+  } catch (cause) {
+    if (init?.signal?.aborted || input?.signal?.aborted) throw cause;
+    throw new Error("无法连接 APIConnect 模型服务，请检查网络和代理。");
+  }
+  if (response.ok) return response;
+  const hints = {
+    401: "模型请求认证失败，请检查这条线路的 Key。",
+    403: "当前 Key 无权调用，请检查模型所属分组。",
+    404: "该线路没有这个模型，请刷新列表并核对模型 ID。",
+    429: "该线路暂时限流，请稍后重试。",
+  };
+  if (!hints[response.status]) return response;
+  const detail = await response.json().catch(() => ({}));
+  const modelDenied = /model_not_found|model_not_available|model.{0,64}not (?:available|found)|模型不支持/i.test(
+    [detail?.error?.type, detail?.error?.code, detail?.error?.message].join(" "));
+  const message = modelDenied ? hints[404] : hints[response.status];
+  const out = new Headers({ "content-type": "application/json" });
+  if (response.headers.has("retry-after")) out.set("retry-after", response.headers.get("retry-after"));
+  if (modelDenied && response.status === 401) out.set("x-magpie-sign-in", "kept");
+  return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), { status: response.status, headers: out });
+}
+
+function wallet(balance) {
+  return { name: "钱包余额", display: "$" + balance.toFixed(2), balance, unit: "USD", aside: true };
+}
+
+function keyQuota(data) {
+  if (data?.isValid === false || data?.status === "expired" || Date.parse(data?.expiresAt) <= Date.now()) {
+    throw Object.assign(new Error("APIConnect 报告 Key 已失效，请更换 Key。"), { signIn: "expired" });
+  }
+  if (data?.subscription && !(Date.parse(data.subscription.expires_at) <= Date.now())) {
+    return subscriptionUsage([data.subscription], data.planName);
+  }
+  if (Number.isFinite(data?.balance)) return { plan: "钱包", windows: [wallet(data.balance)] };
+  if (Number.isFinite(data?.quota?.limit) && data.quota.limit > 0 && Number.isFinite(data.quota.used)) {
+    const { used, limit } = data.quota;
+    return { plan: "Key 额度", windows: [{ name: "Key 额度", amount: used, limit, used: used / limit * 100, unit: data.quota.unit || "USD" }] };
+  }
+  return { plan: "无订阅明细", windows: [{ name: "额度", display: data?.subscription ? "套餐已到期" : "当前 Key 未提供明细", aside: true }] };
+}
+
+function diagnostic(mode, count, kind) {
+  const models = Number.isInteger(count) ? " · 登录时模型 " + count + " 个" : "";
+  return "APIConnect " + pluginVersion + " · " + mode + models + " · " + kind;
 }
 
 async function readQuota(auth, signal) {
   if (auth.type === "api") {
-    const data = await request("/v1/usage", { bearer: auth.key, signal });
-    if (data?.isValid === false || Date.parse(data?.subscription?.expires_at) <= Date.now()) {
-      throw new Error("APIConnect 报告套餐或 Key 已失效。");
+    let data;
+    try {
+      data = await request("/v1/usage", { bearer: auth.key, signal });
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      // Access to the usage endpoint and access to models are independent.
+      return { plan: "额度暂不可查", windows: [{ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, "额度接口：" + error.message), aside: true }] };
     }
-    if (!data?.subscription) throw new Error("此 Key 无订阅明细。请从官网「我的订阅 → 查看可使用套餐的 Key」选择能直接查询订阅的 Key。");
-    return subscriptionUsage([data.subscription], data.planName);
+    const quota = keyQuota(data);
+    const kind = data?.subscription && quota.plan !== "无订阅明细" ? "订阅" : quota.plan;
+    quota.windows.push({ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, kind), aside: true });
+    return quota;
   }
   const opts = { bearer: auth.access, signal };
   const [rows, user, group] = await Promise.all([
@@ -150,12 +203,13 @@ async function readQuota(auth, signal) {
   const quota = subscriptionUsage(active, "APIConnect", group);
   if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: "暂无有效订阅", aside: true });
   if (Number.isFinite(user?.balance)) {
-    quota.windows.push({ name: "钱包余额", display: "$" + user.balance.toFixed(2), aside: true });
+    quota.windows.push(wallet(user.balance));
   }
+  quota.windows.push({ name: "接入诊断", display: diagnostic("官网账号", undefined, "已核对分组"), aside: true });
   return quota;
 }
 
-export default async function apiConnectProvider() {
+export default async function apiConnectProvider(input) {
   return {
     config(config) {
       config.provider ??= {};
@@ -180,6 +234,24 @@ export default async function apiConnectProvider() {
       single: true,
       methods: [
         {
+          type: "api", label: "API Key（充值或套餐）",
+          prompts: [{ type: "password", key: "subscriptionKey", message: "APIConnect API Key" }],
+          async authorize(inputs, { signal } = {}) {
+            try {
+              const key = inputs.subscriptionKey?.trim();
+              if (!key) throw new Error("请填写 API Key。");
+              const auth = { type: "api", key };
+              const models = await listModels(auth, signal);
+              const quota = await readQuota(auth, signal);
+              const message = "发现 " + models.length + " 个模型。额度类型：" + quota.plan + "。请在供应商中重新获取并勾选模型。";
+              await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
+              return { type: "success", key, metadata: { email: "APIConnect Key", modelCount: models.length } };
+            } catch (error) {
+              return { type: "failed", error: error.message };
+            }
+          },
+        },
+        {
           type: "api", label: "官网账号与套餐 API Key",
           prompts: [
             { type: "password", key: "modelKey", message: "同一账号的套餐分组 API Key" },
@@ -200,20 +272,6 @@ export default async function apiConnectProvider() {
                 throw new Error("请填写此账号有效订阅分组里的 API Key。");
               }
               return { type: "success", ...tokens, modelKey: key, groupId: group, accountId: data.user?.email || email };
-            } catch (error) {
-              return { type: "failed", error: error.message };
-            }
-          },
-        },
-        {
-          type: "api", label: "套餐 Key（仅适用能查询订阅的 Key）",
-          prompts: [{ type: "password", key: "subscriptionKey", message: "APIConnect 套餐 Key" }],
-          async authorize(inputs, { signal } = {}) {
-            try {
-              const key = inputs.subscriptionKey?.trim();
-              if (!key) throw new Error("请填写套餐 Key。");
-              await readQuota({ type: "api", key }, signal);
-              return { type: "success", key, metadata: { email: "APIConnect 套餐" } };
             } catch (error) {
               return { type: "failed", error: error.message };
             }

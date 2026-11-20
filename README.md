@@ -1,46 +1,50 @@
 # APIConnect for Magpie
 
-将 APIConnect 的模型和订阅额度放到同一个 Magpie 供应商。登录后，在「供应商 → APIConnect」刷新并选择模型，在「观测 → 用量 → 概览」查看额度。模型列表随绑定的 API Key 更新。
-
-## 安装与登录
-
-在装有 Magpie 的终端运行：
+在 Magpie 里调用 APIConnect 模型、查看套餐用量或钱包余额。先安装插件，再按手里的 Key 选择登录方式。
 
 ```shell
 magpie plugin add https://github.com/heyduanping/magpie-apiconnect
+magpie plugin
 magpie plugin login apiconnect
 ```
 
-选择适合自己的登录方式：
+首次安装后看到 `on`、`0 models` 和 `not signed in` 属于正常状态。
 
-| 登录方式 | 需要填写 | 可以查看 |
+| 我的情况 | 登录时怎么选 | 登录后会看到什么 |
 | --- | --- | --- |
-| 官网账号与套餐 API Key | APIConnect 登录邮箱、密码，以及同一账号下属于有效订阅分组的 API Key | 官网返回的有效订阅额度、到期时间和钱包余额 |
-| 套餐 Key | 能通过 `/v1/usage` 返回订阅详情的 API Key | 该 Key 对应的订阅额度和到期时间 |
+| 我只有充值 Key | 选「API Key」，粘贴 Key | 这把 Key 可见的模型。用量接口提供钱包余额或 Key 限额时，卡片会显示对应读数 |
+| 我买了套餐 | 打开官网「我的订阅 → 查看可使用套餐的 Key」，复制对应分组的有效 Key，先选「API Key」 | Key 返回的套餐、周额度和本期额度。想查看官网账号下其他套餐和钱包时，选「官网账号与套餐 API Key」 |
+| 我已经手动配过 APIConnect | 保留原供应商，按上面的命令安装并登录 | 插件供应商可能名为 `apiconnect-plugin`。后续选择模型、测试、查额度都用界面显示的实际供应商 ID |
 
-**选哪个 Key。** 打开 APIConnect 官网「我的订阅」，点击套餐下的「查看可使用套餐的 Key」，选择对应分组的有效 Key。如果单独填写 Key 时只查到钱包余额，请选第一种登录方式。官网账号启用二次验证时，插件支持使用能直接查询订阅的套餐 Key。
+启用官网二次验证的账号可以直接使用 API Key。此版本保存一份绑定，重新登录会替换之前的绑定。
 
-**已有同名供应商。** 如果先前手动添加过 ID 为 `apiconnect` 的供应商，Magpie 可能给插件供应商分配 `apiconnect-plugin`。登录命令仍使用插件 ID `apiconnect`。选择模型时，以 Magpie 实际列出的完整名称为准；已有路由继续使用原本的供应商。
+## 第一次调用
 
-## 使用
+1. 打开「供应商 → APIConnect」，点击「重新获取模型」，勾选一个模型，记下实际的供应商 ID 和模型 ID。
+2. 运行 `magpie provider test <供应商ID> <模型ID>`。将两个占位符替换为上一步的值。这个操作会发送真实模型请求，可能产生费用。看到成功结果后，在 Agent 中选择 `<供应商ID>/<模型ID>`。
+3. 打开「观测 → 用量 → 概览」，切换到「剩余」。也可运行 `magpie quota refresh <供应商ID>`。模型列表和额度来自两个独立接口，额度读取失败时仍可测试已列出的模型。
 
-首次验证时，按以下顺序操作。
+## 读懂额度
 
-1. 运行 `magpie plugin`，确认 APIConnect 已启用。刚安装时看到 `0 models` 和 `not signed in` 属于正常状态。
-2. 登录后，在「供应商 → APIConnect」重新获取模型并勾选一个，记下供应商 ID 和模型 ID。
-3. 运行 `magpie provider test <供应商ID> <模型ID>` 发起一次小请求，可能产生少量费用。测试成功后，运行 `magpie quota refresh <供应商ID>` 核对额度，再在 Agent 中选择完整模型名。
+- 每日、每周和本期窗口可能记录同一笔消费，各自对照上限看剩余。同一笔用量不要重复相加。
+- 官网账号模式会核对当前 Key 的分组。标有「其他订阅」的窗口仅供查看。暂缺的窗口会标出原因，已取得的额度继续显示。
+- 钱包显示 APIConnect 返回的美元余额。在 Magpie 中可使用 `magpie quota alert --balance 5` 开启余额提醒，此设置作用于 Magpie 支持的余额卡。用量卡和本地提醒不能阻止平台扣款，套餐耗尽后的结算取决于 APIConnect 的套餐和钱包规则。
+- 有明确重置时间的窗口显示下次重置。当前分组只有一个有效套餐时会显示其到期时间。
 
-此版本只保存一份绑定，重新登录会替换之前的绑定。官网账号模式重新核对当前 Key 的分组，其他有效订阅仅供查看。
+## 排查问题
 
-- **调用模型。** 点击「重新获取模型」，勾选要向 Agent 提供的模型。通常使用 `apiconnect/<模型 ID>`。模型请求通过 APIConnect 的 Anthropic Messages 接口发送。
-- **查看额度。** 切换到卡片的「剩余」视图，可查看套餐提供的每日、每周或本期用量上限和剩余金额。同一笔用量可能同时计入周额度和本期额度，两个余额无需相加。官网账号模式在成功取得钱包读数时会另列「钱包余额」。
-- **查看时间。** 有明确重置时间的窗口会显示重置时间。单个有效订阅会显示到期时间。多个有效订阅会按套餐名标注各自的窗口。
-- **命令行刷新。** 运行 `magpie quota refresh apiconnect`；如果同名供应商共存，请用插件在 Magpie 中的实际供应商 ID。
+| 现象 | 怎么处理 |
+| --- | --- |
+| 登录后模型列表为空 | 重新获取模型，核对 Key 在官网所属的分组以及该分组可用的模型 |
+| 模型测试提示 401、403 或模型不存在 | 核对正在使用的线路和 Key，重新获取模型，再测试列表中的确切 ID |
+| 提示 429 或网络连接失败 | 限流后稍候重试。连接失败时检查 Magpie 的供应商代理和本机网络 |
+| 模型可用，额度显示暂不可查 | 点击额度卡刷新，或稍后运行 `magpie quota refresh <供应商ID>`。仅返回 Key 限额时，卡片会标为「Key 额度」 |
+| 官网会话过期 | 用「官网账号与套餐 API Key」重新登录，或选择只需要 Key 的登录方式 |
 
-## 凭据与请求
+提交 issue 时可复制用量卡中的「接入诊断」，另附 Magpie 版本、操作步骤和 HTTP 状态码。诊断文本只含插件版本、登录方式、已知模型数量和额度读取状态。请勿附完整命令输出、API Key、邮箱、密码或会话。
 
-官网账号模式把邮箱和密码发送至 `https://apiconnect.lol/api/v1/auth/login`。插件核对 Key 属于该账号和有效订阅分组后，将 API Key 与可续期的会话交给 Magpie 在本机保存。密码仅用于首次登录或重新登录。插件使用自己的登录会话，浏览器无需保持打开。
+## 凭据和协议
 
-模型列表来自 `GET /v1/models`。模型请求仅发往 `https://apiconnect.lol/v1/messages` 或 `/v1/messages/count_tokens`，使用模型 API Key。项目无运行时 npm 依赖。具体模型可用性和扣费以 APIConnect 的用量记录为准。
+只有官网账号模式会将邮箱和密码提交给 `https://apiconnect.lol/api/v1/auth/login`。密码只用于登录，Magpie 在本机保存模型 Key 和可续期的会话。模型列表来自 `GET /v1/models`。模型请求通过 APIConnect 的 Anthropic Messages 接口发送，支持 `/v1/messages` 和 `/v1/messages/count_tokens`。插件不依赖运行时 npm 包。
 
-[APIConnect](https://apiconnect.lol) · [Magpie 插件文档](https://usemagpie.ai/docs/plugins) · [MIT 许可证](LICENSE)
+[APIConnect](https://apiconnect.lol) · [Magpie 插件文档](https://usemagpie.ai/docs/zh/plugins) · [MIT 许可证](LICENSE)
