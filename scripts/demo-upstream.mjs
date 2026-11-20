@@ -16,6 +16,16 @@ globalThis.fetch = async (url, init = {}) => {
   const target = new URL(url instanceof Request ? url.url : url);
   if (target.origin !== "https://apiconnect.lol") throw new Error("Offline fixture");
   const endpoint = target.pathname;
+  if (new Headers(init.headers).get("authorization") === "Bearer retired-fixture") return new Response(null, { status: 401 });
+  if (endpoint === "/api/v1/auth/refresh" && JSON.parse(init.body).refresh_token === "expired-dashboard") {
+    return new Response(null, { status: 401 });
+  }
+  if (endpoint.startsWith("/api/") && new Headers(init.headers).get("authorization") === "Bearer expired-dashboard") {
+    return new Response(null, { status: 401 });
+  }
+  const replacement = new Headers(init.headers).get("authorization") === "Bearer replacement-fixture";
+  if (replacement && endpoint === "/v1/models") return Response.json({ data: [demoModel, { ...demoModel, id: "claude-new" }] });
+  if (replacement && endpoint === "/v1/usage") return Response.json({ isValid: true, balance: 8 });
   if (endpoint === "/v1/messages" || endpoint === "/v1/responses") {
     const headers = new Headers(init.headers);
     const key = headers.get("x-api-key") ?? headers.get("authorization")?.replace(/^Bearer /, "");

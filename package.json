@@ -1,12 +1,13 @@
 {
   "name": "magpie-apiconnect-quota",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "scripts": { "test": "node --test" },
   "description": "APIConnect subscription quotas, wallet balance and Anthropic models in one Magpie provider",
   "type": "module",
   "main": "./index.mjs",
   "files": [
     "index.mjs",
+    "rotation.mjs",
     "docs/images"
   ],
   "keywords": [

@@ -1,13 +1,14 @@
 import { createHash } from "node:crypto";
+import { loginMethods } from "./rotation.mjs";
 
 const provider = "apiconnect";
 const modelBase = "https://apiconnect.lol/v1";
 const anthropic = "@ai-sdk/anthropic";
 const site = "https://apiconnect.lol";
 const day = 86400000;
-const pluginVersion = "0.4.1";
+const pluginVersion = "0.5.0";
 const responses = "@ai-sdk/openai";
-const linePrompt = { type: "text", key: "line", message: "线路名（如 daily、backup；同名更新，留空自动命名）" };
+const linePrompt = { type: "text", key: "line", message: "线路名（如 daily、backup，留空自动命名；换 Key 请选择预览）" };
 
 function fingerprint(value) {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
@@ -45,6 +46,7 @@ async function request(path, { bearer, body, signal } = {}) {
     const subject = path.startsWith("/v1/") ? "模型 Key" : path.endsWith("/login") ? "邮箱或密码" : "官网会话";
     const hint = { 400: "请求未被接受，请检查填写的信息。", 401: subject + "无效，请重新验证。", 403: "当前凭据无权访问，请检查分组和权限。", 429: "请求过于频繁，请稍后重试。" };
     const error = new Error("APIConnect HTTP " + status + "，" + (hint[status] || "服务暂不可用，请稍后重试。"));
+    if (status === 401 && path === "/v1/usage") error.message = "APIConnect HTTP 401，用量接口未接受此 Key。";
     error.status = status;
     if (status === 401 && path === "/v1/models") error.signIn = "expired";
     throw error;
@@ -140,6 +142,10 @@ function catalogSummary(catalog) {
   return "上游返回 " + catalog.total + " 个模型，兼容 " + catalog.models.length + " 个。请在供应商中重新获取并勾选模型。";
 }
 
+function catalogCounts(catalog) {
+  return catalog ? "上游 " + catalog.total + " 个 / 兼容 " + catalog.models.length + " 个" : "模型数量暂不可查";
+}
+
 async function lookupGroup(access, key, signal) {
   for (let page = 1; ; page++) {
     const result = await request("/api/v1/keys?page_size=100&page=" + page, { bearer: access, signal });
@@ -196,7 +202,9 @@ async function sendModel(input, init, getAuth) {
   const message = modelDenied ? hints[404] : hints[response.status];
   const out = new Headers({ "content-type": "application/json" });
   if (response.headers.has("retry-after")) out.set("retry-after", response.headers.get("retry-after"));
-  if (modelDenied && response.status === 401) out.set("x-magpie-sign-in", "kept");
+  // This request authenticates with the model key, even for dashboard logins.
+  // A bare 401 makes Magpie try renewing the unrelated dashboard token.
+  if (response.status === 401) out.set("x-magpie-sign-in", modelDenied ? "kept" : "expired");
   return new Response(JSON.stringify({ type: "error", error: { type: "api_error", message } }), { status: response.status, headers: out });
 }
 
@@ -272,6 +280,7 @@ async function readQuota(auth, signal) {
   if (auth.type === "api" || auth.dashboardExpired) {
     const quota = await keyReading(auth, signal);
     quota.windows.push({ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, quota.source), aside: true });
+    quota.dashboardStatus = auth.dashboardExpired ? "已过期" : "未绑定";
     if (auth.dashboardExpired) quota.windows.push({ name: "官网会话", display: "已过期，请重新登录官网账号恢复订阅读数", aside: true });
     return quota;
   }
@@ -289,6 +298,7 @@ async function readQuota(auth, signal) {
     keyReading(auth, signal),
   ]);
   if (sessionExpired) {
+    keyUsage.dashboardStatus = "已过期";
     keyUsage.windows.push({ name: "官网会话", display: "已过期，请重新登录官网账号恢复订阅读数", aside: true });
     keyUsage.windows.push({ name: "接入诊断", display: diagnostic("官网账号", auth.modelCount, "官网会话过期 / Key 额度来源：" + keyUsage.source), aside: true });
     return keyUsage;
@@ -296,19 +306,47 @@ async function readQuota(auth, signal) {
   const available = Array.isArray(rows);
   const active = (available ? rows : []).filter(row => row && (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now()));
   const quota = subscriptionUsage(active, "APIConnect", group);
-  quota.source = available && active.some(row => groupIds(row).includes(group)) ? "订阅" : keyUsage.source;
+  const bound = active.filter(row => groupIds(row).includes(group));
+  quota.source = bound.length ? "订阅" : keyUsage.source;
+  quota.currentPlan = bound.map(row => row.group_names?.join(" / ") || row.group?.name || "订阅").join("、") || keyUsage.plan;
+  quota.dashboardStatus = available || user || group !== null ? "有效" : "暂不可查";
   quota.windows.push(...keyUsage.windows.filter(w => w.name === "Key 额度" || w.name.startsWith("Key · ")));
   for (const row of active.filter(row => groupIds(row).includes(group))) quota.windows.push(sharedPlan(row));
   const groupStatus = !available ? "订阅列表暂不可查" : group === null ? "分组暂未核实，订阅仅供查看" : "已核对分组";
   if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: available && group !== null ? "暂无有效订阅" : groupStatus, aside: true });
-  if (Number.isFinite(user?.balance)) {
-    quota.windows.push(wallet(user.balance));
-  }
+  if (Number.isFinite(user?.balance)) quota.windows.push(wallet(user.balance));
+  else if (keyUsage.windows.some(w => w.name === "钱包余额")) quota.windows.push(keyUsage.windows.find(w => w.name === "钱包余额"));
   quota.windows.push({ name: "接入诊断", display: diagnostic("官网账号", auth.modelCount, groupStatus), aside: true });
   return quota;
 }
 
+async function inspectRoute(auth, signal) {
+  async function probe(fn) {
+    try {
+      return { value: await fn(auth, signal) };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { error };
+    }
+  }
+  const [models, usage] = await Promise.all([probe(listModels), probe(readQuota)]);
+  const quota = usage.value ?? { plan: "额度暂不可查", source: usage.error.message, windows: [] };
+  const invalid = [models.error, usage.error].some(error => error?.signIn === "expired");
+  const keyState = invalid ? "已失效" : models.value ? "有效" : "暂未核实";
+  const sessionState = quota.dashboardStatus ?? (auth.type === "api" ? "未绑定" : "暂未核实");
+  quota.windows.push({ name: "线路自检", display: "模型 Key " + keyState + " / " + catalogCounts(models.value) +
+    " / 官网会话" + sessionState + " / 额度来源：" + quota.source, aside: true });
+  if (invalid) quota.signIn = "expired";
+  else if (models.error) quota.signIn = "kept";
+  return { quota, catalog: models.value };
+}
+
 export default async function apiConnectProvider(input) {
+  const rotation = {
+    directory: input?.project?.id === "magpie" ? input.directory : undefined,
+    selectedSlot: () => input?.magpie?.account?.(provider),
+    lineName, inspectRoute,
+  };
   return {
     config(config) {
       config.provider ??= {};
@@ -345,11 +383,11 @@ export default async function apiConnectProvider(input) {
         return { baseURL: modelBase, apiKey: "unused", fetch: (input, init) => sendModel(input, init, getAuth) };
       },
       provider,
-      methods: [
+      methods: loginMethods([
         {
           type: "api", label: "API Key（充值或套餐）",
           prompts: [{ type: "password", key: "subscriptionKey", message: "APIConnect API Key" }, linePrompt],
-          async authorize(inputs, { signal } = {}) {
+          async authorize(inputs, { signal, preview } = {}) {
             try {
               const key = inputs.subscriptionKey?.trim();
               if (!key) throw new Error("请填写 API Key。");
@@ -358,8 +396,9 @@ export default async function apiConnectProvider(input) {
               const catalog = await listModels(auth, signal);
               const quota = await readQuota(auth, signal);
               const message = catalogSummary(catalog) + " 额度类型：" + quota.plan;
-              await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
-              return { type: "success", key, metadata: { email: line, line, namedLine: !!inputs.line?.trim(), modelCount: catalog.models.length, planLabel: quota.plan } };
+              if (!preview) await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
+              return { type: "success", key, metadata: { email: line, line, namedLine: !!inputs.line?.trim(), modelCount: catalog.models.length,
+                modelIds: catalog.models.map(m => m.id), quotaSource: quota.source, planLabel: quota.plan } };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
@@ -373,7 +412,7 @@ export default async function apiConnectProvider(input) {
             { type: "password", key: "password", message: "APIConnect 登录密码" },
             linePrompt,
           ],
-          async authorize(inputs, { signal } = {}) {
+          async authorize(inputs, { signal, preview } = {}) {
             try {
               const key = inputs.modelKey?.trim();
               if (!key) throw new Error("请填写同一账号的套餐分组 API Key。");
@@ -394,14 +433,15 @@ export default async function apiConnectProvider(input) {
                 return null;
               });
               const message = "已绑定订阅分组。" + catalogSummary(listed);
-              await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
-              return { type: "success", ...tokens, modelKey: key, groupId: group, line, namedLine: !!inputs.line?.trim(), planLabel, accountId: line, modelCount: listed?.models.length };
+              if (!preview) await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
+              return { type: "success", ...tokens, modelKey: key, groupId: group, line, namedLine: !!inputs.line?.trim(), planLabel, accountId: line,
+                modelCount: listed?.models.length, modelIds: listed?.models.map(m => m.id), quotaSource: "订阅" };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
           },
         },
-      ],
+      ], rotation),
       async refresh(auth) {
         try {
           const tokens = session(await request("/api/v1/auth/refresh", { body: { refresh_token: auth.refresh }, signal: AbortSignal.timeout(15000) }), auth.refresh);
@@ -413,7 +453,7 @@ export default async function apiConnectProvider(input) {
       },
       async usage(getAuth, _provider, { signal } = {}) {
         try {
-          return await readQuota(await getAuth(), signal);
+          return (await inspectRoute(await getAuth(), signal)).quota;
         } catch (error) {
           return { error: error.message, ...(error.signIn ? { signIn: error.signIn } : {}) };
         }
