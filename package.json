@@ -1,6 +1,6 @@
 {
   "name": "magpie-apiconnect-quota",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "scripts": { "test": "node --test" },
   "description": "APIConnect subscription quotas, wallet balance and Anthropic models in one Magpie provider",
   "type": "module",

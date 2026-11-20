@@ -5,7 +5,7 @@ const modelBase = "https://apiconnect.lol/v1";
 const anthropic = "@ai-sdk/anthropic";
 const site = "https://apiconnect.lol";
 const day = 86400000;
-const pluginVersion = "0.4.0";
+const pluginVersion = "0.4.1";
 const responses = "@ai-sdk/openai";
 const linePrompt = { type: "text", key: "line", message: "线路名（如 daily、backup；同名更新，留空自动命名）" };
 
@@ -45,7 +45,8 @@ async function request(path, { bearer, body, signal } = {}) {
     const subject = path.startsWith("/v1/") ? "模型 Key" : path.endsWith("/login") ? "邮箱或密码" : "官网会话";
     const hint = { 400: "请求未被接受，请检查填写的信息。", 401: subject + "无效，请重新验证。", 403: "当前凭据无权访问，请检查分组和权限。", 429: "请求过于频繁，请稍后重试。" };
     const error = new Error("APIConnect HTTP " + status + "，" + (hint[status] || "服务暂不可用，请稍后重试。"));
-    if (response.status === 401) error.signIn = "expired";
+    error.status = status;
+    if (status === 401 && path === "/v1/models") error.signIn = "expired";
     throw error;
   }
   const payload = await response.json().catch(() => { throw new Error("APIConnect 未返回 JSON 数据。"); });
@@ -122,13 +123,21 @@ function modelKey(auth) {
 async function listModels(auth, signal) {
   const result = await request("/v1/models", { bearer: modelKey(auth), signal });
   if (!Array.isArray(result?.data)) throw new Error("APIConnect 未返回模型列表。");
-  return result.data.filter(model => {
+  const models = result.data.filter(model => {
     if (typeof model?.id !== "string" || !/^[\w.-]+$/.test(model.id)) return false;
     const endpoints = model.supported_endpoint_types;
     if (endpoints == null) return /^claude-/i.test(model.id);
     if (!Array.isArray(endpoints)) return false;
     return endpoints.includes("messages") || endpoints.includes("responses");
   });
+  return { total: result.data.length, models };
+}
+
+function catalogSummary(catalog) {
+  if (!catalog) return "模型列表暂不可查，请稍后刷新。";
+  if (!catalog.total) return "上游返回空列表，请检查 Key 的分组是否开放模型。";
+  if (!catalog.models.length) return "上游返回 " + catalog.total + " 个模型，兼容 0 个。请检查线路是否提供 Messages 或 Responses 模型。";
+  return "上游返回 " + catalog.total + " 个模型，兼容 " + catalog.models.length + " 个。请在供应商中重新获取并勾选模型。";
 }
 
 async function lookupGroup(access, key, signal) {
@@ -137,6 +146,9 @@ async function lookupGroup(access, key, signal) {
     const rows = result?.items;
     if (!Array.isArray(rows)) throw new Error("无法核对 API Key 的订阅分组。");
     const match = rows.find(row => row.key === key);
+    if (match && ["disabled", "revoked", "expired"].includes(match.status)) {
+      throw Object.assign(new Error("官网报告此线路的模型 Key 已停用或过期，请更换 Key。"), { signIn: "expired" });
+    }
     if (match?.status === "active") {
       const [group] = groupIds(match);
       if (group !== undefined) return group;
@@ -192,19 +204,45 @@ function wallet(balance) {
   return { name: "钱包余额", display: "$" + balance.toFixed(2), balance, unit: "USD", aside: true };
 }
 
+function keyLimits(data) {
+  const windows = [];
+  function add(name, value, reset) {
+    if (!Number.isFinite(value?.limit) || value.limit <= 0) return;
+    const amount = Number.isFinite(value.used) ? value.used :
+      Number.isFinite(value.remaining) ? value.limit - value.remaining : NaN;
+    if (!Number.isFinite(amount) || amount < 0) return;
+    const window = { name, amount, limit: value.limit, unit: value.unit || "USD", used: amount / value.limit * 100 };
+    const end = Date.parse(reset);
+    if (Number.isFinite(end)) window.resetsAt = new Date(end).toISOString();
+    windows.push(window);
+  }
+  add("Key 额度", data?.quota);
+  for (const row of Array.isArray(data?.rate_limits) ? data.rate_limits : []) {
+    if (typeof row?.window === "string" && row.window) add("Key · " + row.window, row, row.reset_at);
+  }
+  return windows;
+}
+
 function keyQuota(data) {
   if (data?.isValid === false || data?.status === "expired" || Date.parse(data?.expires_at ?? data?.expiresAt) <= Date.now()) {
     throw Object.assign(new Error("APIConnect 报告 Key 已失效，请更换 Key。"), { signIn: "expired" });
   }
-  if (data?.subscription && !(Date.parse(data.subscription.expires_at) <= Date.now())) {
-    return subscriptionUsage([data.subscription], data.planName);
+  const expiredPlan = Date.parse(data?.subscription?.expires_at) <= Date.now();
+  const limits = keyLimits(data);
+  let quota;
+  if (data?.subscription && !expiredPlan) {
+    quota = subscriptionUsage([data.subscription], data.planName);
+    quota.source = "订阅";
+    quota.windows.push(sharedPlan(data.subscription, data.planName));
+  } else {
+    const source = Number.isFinite(data?.balance) ? "钱包" : limits.length ? "Key 额度" : "无订阅明细";
+    quota = { plan: source, source, windows: [] };
+    if (expiredPlan) quota.windows.push({ name: "订阅", display: "套餐已到期", aside: true });
   }
-  if (Number.isFinite(data?.balance)) return { plan: "钱包", windows: [wallet(data.balance)] };
-  if (Number.isFinite(data?.quota?.limit) && data.quota.limit > 0 && Number.isFinite(data.quota.used)) {
-    const { used, limit } = data.quota;
-    return { plan: "Key 额度", windows: [{ name: "Key 额度", amount: used, limit, used: used / limit * 100, unit: data.quota.unit || "USD" }] };
-  }
-  return { plan: "无订阅明细", windows: [{ name: "额度", display: data?.subscription ? "套餐已到期" : "当前 Key 未提供明细", aside: true }] };
+  quota.windows.push(...limits);
+  if (Number.isFinite(data?.balance)) quota.windows.push(wallet(data.balance));
+  if (!quota.windows.length) quota.windows.push({ name: "额度", display: "当前 Key 未提供明细", aside: true });
+  return quota;
 }
 
 function diagnostic(mode, count, kind) {
@@ -219,37 +257,47 @@ function sharedPlan(row, fallback) {
   return { name: "共享套餐", display: name + identity + " · 同一订阅下的 Key 共用额度，只计一次", aside: true };
 }
 
+async function keyReading(auth, signal) {
+  let data;
+  try {
+    data = await request("/v1/usage", { bearer: modelKey(auth), signal });
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    return { plan: "额度暂不可查", source: "额度接口：" + error.message, windows: [] };
+  }
+  return keyQuota(data);
+}
+
 async function readQuota(auth, signal) {
-  if (auth.type === "api") {
-    let data;
-    try {
-      data = await request("/v1/usage", { bearer: auth.key, signal });
-    } catch (error) {
-      if (signal?.aborted) throw error;
-      // Access to the usage endpoint and access to models are independent.
-      return { plan: "额度暂不可查", windows: [{ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, "额度接口：" + error.message), aside: true }] };
-    }
-    const quota = keyQuota(data);
-    const kind = data?.subscription && quota.plan !== "无订阅明细" ? "订阅" : quota.plan;
-    if (kind === "订阅") quota.windows.push(sharedPlan(data.subscription, data.planName));
-    quota.windows.push({ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, kind), aside: true });
+  if (auth.type === "api" || auth.dashboardExpired) {
+    const quota = await keyReading(auth, signal);
+    quota.windows.push({ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, quota.source), aside: true });
+    if (auth.dashboardExpired) quota.windows.push({ name: "官网会话", display: "已过期，请重新登录官网账号恢复订阅读数", aside: true });
     return quota;
   }
   const opts = { bearer: auth.access, signal };
-  const [rows, user, group] = await Promise.all([
-    request("/api/v1/subscriptions", opts).catch(error => {
-      if (signal?.aborted || error.signIn) throw error;
-      return null;
-    }),
-    request("/api/v1/auth/me", opts).catch(() => null),
-    lookupGroup(auth.access, modelKey(auth), signal).catch(error => {
-      if (signal?.aborted || error.signIn) throw error;
-      return null;
-    }),
+  let sessionExpired = false;
+  function optional(error) {
+    if (signal?.aborted || error.signIn) throw error;
+    if (error.status === 401) sessionExpired = true;
+    return null;
+  }
+  const [rows, user, group, keyUsage] = await Promise.all([
+    request("/api/v1/subscriptions", opts).catch(optional),
+    request("/api/v1/auth/me", opts).catch(optional),
+    lookupGroup(auth.access, modelKey(auth), signal).catch(optional),
+    keyReading(auth, signal),
   ]);
+  if (sessionExpired) {
+    keyUsage.windows.push({ name: "官网会话", display: "已过期，请重新登录官网账号恢复订阅读数", aside: true });
+    keyUsage.windows.push({ name: "接入诊断", display: diagnostic("官网账号", auth.modelCount, "官网会话过期 / Key 额度来源：" + keyUsage.source), aside: true });
+    return keyUsage;
+  }
   const available = Array.isArray(rows);
   const active = (available ? rows : []).filter(row => row && (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now()));
   const quota = subscriptionUsage(active, "APIConnect", group);
+  quota.source = available && active.some(row => groupIds(row).includes(group)) ? "订阅" : keyUsage.source;
+  quota.windows.push(...keyUsage.windows.filter(w => w.name === "Key 额度" || w.name.startsWith("Key · ")));
   for (const row of active.filter(row => groupIds(row).includes(group))) quota.windows.push(sharedPlan(row));
   const groupStatus = !available ? "订阅列表暂不可查" : group === null ? "分组暂未核实，订阅仅供查看" : "已核对分组";
   if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: available && group !== null ? "暂无有效订阅" : groupStatus, aside: true });
@@ -270,7 +318,7 @@ export default async function apiConnectProvider(input) {
       id: provider,
       async models(info, { auth, signal } = {}) {
         if (!auth) return {};
-        const models = await listModels(auth, signal);
+        const { models } = await listModels(auth, signal);
         const result = Object.create(null);
         const aliases = Object.create(null);
         const line = auth.line ?? auth.metadata?.line;
@@ -307,11 +355,11 @@ export default async function apiConnectProvider(input) {
               if (!key) throw new Error("请填写 API Key。");
               const line = lineName(inputs, key);
               const auth = { type: "api", key };
-              const models = await listModels(auth, signal);
+              const catalog = await listModels(auth, signal);
               const quota = await readQuota(auth, signal);
-              const message = "发现 " + models.length + " 个模型。额度类型：" + quota.plan + "。请在供应商中重新获取并勾选模型。";
+              const message = catalogSummary(catalog) + " 额度类型：" + quota.plan;
               await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
-              return { type: "success", key, metadata: { email: line, line, namedLine: !!inputs.line?.trim(), modelCount: models.length, planLabel: quota.plan } };
+              return { type: "success", key, metadata: { email: line, line, namedLine: !!inputs.line?.trim(), modelCount: catalog.models.length, planLabel: quota.plan } };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
@@ -345,9 +393,9 @@ export default async function apiConnectProvider(input) {
                 if (signal?.aborted || error.signIn) throw error;
                 return null;
               });
-              const message = (listed ? "发现 " + listed.length + " 个模型" : "模型列表暂不可查") + "，已绑定订阅分组。请在供应商中重新获取并勾选模型。";
+              const message = "已绑定订阅分组。" + catalogSummary(listed);
               await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
-              return { type: "success", ...tokens, modelKey: key, groupId: group, line, namedLine: !!inputs.line?.trim(), planLabel, accountId: line, modelCount: listed?.length };
+              return { type: "success", ...tokens, modelKey: key, groupId: group, line, namedLine: !!inputs.line?.trim(), planLabel, accountId: line, modelCount: listed?.models.length };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
@@ -355,7 +403,13 @@ export default async function apiConnectProvider(input) {
         },
       ],
       async refresh(auth) {
-        return session(await request("/api/v1/auth/refresh", { body: { refresh_token: auth.refresh }, signal: AbortSignal.timeout(15000) }), auth.refresh);
+        try {
+          const tokens = session(await request("/api/v1/auth/refresh", { body: { refresh_token: auth.refresh }, signal: AbortSignal.timeout(15000) }), auth.refresh);
+          return { ...tokens, dashboardExpired: false };
+        } catch (error) {
+          if (error.status === 401) return { dashboardExpired: true, expires: 0 };
+          throw error;
+        }
       },
       async usage(getAuth, _provider, { signal } = {}) {
         try {
