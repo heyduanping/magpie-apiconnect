@@ -23,10 +23,11 @@ function fixture(t, routes) {
 }
 
 test("dashboard login binds the verified active group", async t => {
-  fixture(t, { "/api/v1/auth/login": login, "/api/v1/keys": groupKeys, "/api/v1/subscriptions/active": [plan(1, 20)] });
+  fixture(t, { "/api/v1/auth/login": login, "/api/v1/keys": groupKeys, "/api/v1/subscriptions/active": [plan(1, 20)], "/v1/models": { data: [{ id: "claude-example" }] } });
   const result = await accountMethod.authorize(dashboardInputs);
   assert.equal(result.type, "success");
   assert.equal(result.groupId, "1");
+  assert.equal(result.modelCount, 1);
   assert.ok(!Object.values(result).includes(dashboardInputs.password));
 });
 
@@ -40,6 +41,23 @@ test("legacy account resolves its key group and isolates unrelated or partial qu
   assert.ok(q.windows.some(w => w.used === 100 && w.aside));
   assert.ok(q.windows.some(w => w.display?.includes("本次未取得")));
   assert.ok(q.windows.some(w => w.display === "$12.00"));
+  assert.ok(q.windows.some(w => w.used === 20 && w.display.includes("$100") && w.limit === undefined));
+});
+
+test("unverified group leaves amounts visible without assigning them to this key", async t => {
+  fixture(t, { "/api/v1/keys": new Response("", { status: 503 }), "/api/v1/auth/me": { balance: 12 },
+    "/api/v1/subscriptions": [plan(1, 20), plan(2, 100)] });
+  const q = await hooks.auth.usage(async () => dashboard);
+  assert.ok(q.windows.every(w => w.aside));
+  assert.ok(q.windows.some(w => w.display.includes("分组暂未核实")));
+  assert.ok(q.windows.some(w => w.balance === 12));
+});
+
+test("refresh preserves the previous renewal token if upstream omits a new one", async t => {
+  fixture(t, { "/api/v1/auth/refresh": { access_token: "next-access", expires_in: 300 } });
+  const r = await hooks.auth.refresh({ refresh: "first-renewal" });
+  assert.equal(r.refresh, "first-renewal");
+  assert.equal(r.access, "next-access");
 });
 
 test("two-factor guidance points to a usable key", async t => {

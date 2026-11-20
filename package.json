@@ -1,12 +1,13 @@
 {
   "name": "magpie-apiconnect-quota",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "scripts": { "test": "node --test" },
   "description": "APIConnect subscription quotas, wallet balance and Anthropic models in one Magpie provider",
   "type": "module",
   "main": "./index.mjs",
   "files": [
-    "index.mjs"
+    "index.mjs",
+    "docs/images"
   ],
   "keywords": [
     "magpie-plugin",
@@ -23,8 +24,8 @@
     "name": "APIConnect",
     "icon": "https://apiconnect.lol/logo.svg",
     "summary": {
-      "zh": "在同一个供应商中调用 APIConnect 模型，查看订阅余量和钱包余额。",
-      "en": "Use APIConnect models and view subscription allowances and wallet balance in one provider."
+      "zh": "用充值或套餐 Key 接入模型，切换线路并查看共享订阅及钱包余额。",
+      "en": "Connect prepaid and subscription keys, select a route, and view shared quotas and wallet balances."
     }
   }
 }

@@ -1,9 +1,26 @@
+import { createHash } from "node:crypto";
+
 const provider = "apiconnect";
 const modelBase = "https://apiconnect.lol/v1";
 const anthropic = "@ai-sdk/anthropic";
 const site = "https://apiconnect.lol";
 const day = 86400000;
-const pluginVersion = "0.3.0";
+const pluginVersion = "0.4.0";
+const responses = "@ai-sdk/openai";
+const linePrompt = { type: "text", key: "line", message: "线路名（如 daily、backup；同名更新，留空自动命名）" };
+
+function fingerprint(value) {
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
+}
+
+function lineName(inputs, key) {
+  const name = inputs.line?.trim();
+  if (!name) return "Key-" + fingerprint(key);
+  if (!/^[\p{L}\p{N}_-]{1,32}$/u.test(name) || name === key || /^(?:sk-|Bearer)/i.test(name)) {
+    throw new Error("线路名请用 1 至 32 个字母、汉字、数字、短横线或下划线。请勿填写密钥。");
+  }
+  return name;
+}
 
 async function request(path, { bearer, body, signal } = {}) {
   let response;
@@ -26,7 +43,7 @@ async function request(path, { bearer, body, signal } = {}) {
   if (!response.ok) {
     const status = response.status;
     const subject = path.startsWith("/v1/") ? "模型 Key" : path.endsWith("/login") ? "邮箱或密码" : "官网会话";
-    const hint = { 401: subject + "无效，请重新验证。", 403: "当前凭据无权访问，请检查分组和权限。", 429: "请求过于频繁，请稍后重试。" };
+    const hint = { 400: "请求未被接受，请检查填写的信息。", 401: subject + "无效，请重新验证。", 403: "当前凭据无权访问，请检查分组和权限。", 429: "请求过于频繁，请稍后重试。" };
     const error = new Error("APIConnect HTTP " + status + "，" + (hint[status] || "服务暂不可用，请稍后重试。"));
     if (response.status === 401) error.signIn = "expired";
     throw error;
@@ -39,18 +56,21 @@ async function request(path, { bearer, body, signal } = {}) {
   return payload;
 }
 
-function session(data) {
+function session(data, previousRefresh) {
   if (data?.requires_2fa) throw new Error("该账号启用了二次验证。请使用 API Key 登录；需要查看其他订阅时可打开官网「我的订阅」。");
-  if (!data?.access_token || !data.refresh_token || !(data.expires_in > 0)) {
+  const refresh = data?.refresh_token || previousRefresh;
+  if (!data?.access_token || !refresh || !(data.expires_in > 0)) {
     throw new Error("APIConnect 未返回可续期的登录信息。");
   }
-  return { access: data.access_token, refresh: data.refresh_token, expires: Date.now() + data.expires_in * 1000 };
+  return { access: data.access_token, refresh, expires: Date.now() + data.expires_in * 1000 };
 }
 
 function groupIds(row) {
   return [row.group_id, row.group?.id, ...(Array.isArray(row.group_ids) ? row.group_ids : [])]
-    .filter(id => typeof id === "string" && id.trim() || Number.isSafeInteger(id)).map(String);
+    .filter(id => (typeof id === "string" && id.trim()) || Number.isSafeInteger(id)).map(String);
 }
+
+const money = n => Number(n.toFixed(4)).toString();
 
 function subscriptionUsage(records, fallbackName = "APIConnect 订阅", boundGroup) {
   const windows = [];
@@ -66,14 +86,17 @@ function subscriptionUsage(records, fallbackName = "APIConnect 订阅", boundGro
     for (const [period, label, days] of [
       ["daily", "每日", null], ["weekly", "每周", 7], ["monthly", "本期", termDays || null],
     ]) {
-      const limit = limits[period + "_limit_usd"];
+      const limit = row[period + "_limit_usd"] ?? limits[period + "_limit_usd"];
       if (!Number.isFinite(limit) || limit <= 0) continue;
       const amount = row[period + "_usage_usd"];
       if (!Number.isFinite(amount) || amount < 0) {
         windows.push({ name: prefix + label, display: "本次未取得用量", aside: true });
         continue;
       }
-      const window = { name: prefix + label, used: 100 * amount / limit, amount, limit, unit: "USD", aside };
+      // Magpie sums numeric limits across accounts. Multiple keys can spend the
+      // same subscription. Keep the routing percentage and show its dollars verbatim.
+      const display = `已用 $${money(amount)} / $${money(limit)}，剩余 $${money(Math.max(0, limit - amount))}`;
+      const window = { name: prefix + label, used: 100 * amount / limit, display, aside };
       const start = Date.parse(row[period + "_window_start"]);
       const end = Date.parse(row.expires_at);
       const reportedReset = Date.parse(row[period + "_reset_at"]);
@@ -99,7 +122,13 @@ function modelKey(auth) {
 async function listModels(auth, signal) {
   const result = await request("/v1/models", { bearer: modelKey(auth), signal });
   if (!Array.isArray(result?.data)) throw new Error("APIConnect 未返回模型列表。");
-  return result.data.filter(model => typeof model?.id === "string" && /^[\w.-]+$/.test(model.id));
+  return result.data.filter(model => {
+    if (typeof model?.id !== "string" || !/^[\w.-]+$/.test(model.id)) return false;
+    const endpoints = model.supported_endpoint_types;
+    if (endpoints == null) return /^claude-/i.test(model.id);
+    if (!Array.isArray(endpoints)) return false;
+    return endpoints.includes("messages") || endpoints.includes("responses");
+  });
 }
 
 async function lookupGroup(access, key, signal) {
@@ -121,13 +150,19 @@ async function sendModel(input, init, getAuth) {
   const url = new URL(input instanceof Request ? input.url : input);
   const method = init?.method ?? (input instanceof Request ? input.method : "GET");
   if (url.origin !== site || url.username || url.password || method !== "POST" ||
-      !["/v1/messages", "/v1/messages/count_tokens"].includes(url.pathname)) {
-    throw new Error("APIConnect 仅接受本站的 Anthropic Messages 请求。");
+      !["/v1/messages", "/v1/messages/count_tokens", "/v1/responses"].includes(url.pathname)) {
+    throw new Error("APIConnect 仅接受本站已支持的模型接口。");
   }
   const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
   for (const name of ["authorization", "cookie", "proxy-authorization", "x-goog-api-key", "x-api-key"]) headers.delete(name);
-  headers.set("x-api-key", modelKey(await getAuth()));
-  if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
+  const key = modelKey(await getAuth());
+  if (url.pathname === "/v1/responses") {
+    headers.set("authorization", "Bearer " + key);
+    headers.delete("anthropic-version");
+  } else {
+    headers.set("x-api-key", key);
+    if (!headers.has("anthropic-version")) headers.set("anthropic-version", "2023-06-01");
+  }
   let response;
   try {
     response = await fetch(input, { ...init, headers, redirect: "error" });
@@ -158,7 +193,7 @@ function wallet(balance) {
 }
 
 function keyQuota(data) {
-  if (data?.isValid === false || data?.status === "expired" || Date.parse(data?.expiresAt) <= Date.now()) {
+  if (data?.isValid === false || data?.status === "expired" || Date.parse(data?.expires_at ?? data?.expiresAt) <= Date.now()) {
     throw Object.assign(new Error("APIConnect 报告 Key 已失效，请更换 Key。"), { signIn: "expired" });
   }
   if (data?.subscription && !(Date.parse(data.subscription.expires_at) <= Date.now())) {
@@ -173,8 +208,15 @@ function keyQuota(data) {
 }
 
 function diagnostic(mode, count, kind) {
-  const models = Number.isInteger(count) ? " · 登录时模型 " + count + " 个" : "";
-  return "APIConnect " + pluginVersion + " · " + mode + models + " · " + kind;
+  const models = Number.isInteger(count) ? " / 登录时模型 " + count + " 个" : "";
+  return "APIConnect " + pluginVersion + " / " + mode + models + " / " + kind;
+}
+
+function sharedPlan(row, fallback) {
+  const name = row.group_names?.join(" / ") || row.group?.name || fallback || "套餐";
+  const id = row.subscription_id ?? row.id;
+  const identity = id != null ? " #" + fingerprint("subscription:" + id) : "";
+  return { name: "共享套餐", display: name + identity + " · 同一订阅下的 Key 共用额度，只计一次", aside: true };
 }
 
 async function readQuota(auth, signal) {
@@ -189,23 +231,32 @@ async function readQuota(auth, signal) {
     }
     const quota = keyQuota(data);
     const kind = data?.subscription && quota.plan !== "无订阅明细" ? "订阅" : quota.plan;
+    if (kind === "订阅") quota.windows.push(sharedPlan(data.subscription, data.planName));
     quota.windows.push({ name: "接入诊断", display: diagnostic("API Key", auth.metadata?.modelCount, kind), aside: true });
     return quota;
   }
   const opts = { bearer: auth.access, signal };
   const [rows, user, group] = await Promise.all([
-    request("/api/v1/subscriptions", opts),
+    request("/api/v1/subscriptions", opts).catch(error => {
+      if (signal?.aborted || error.signIn) throw error;
+      return null;
+    }),
     request("/api/v1/auth/me", opts).catch(() => null),
-    lookupGroup(auth.access, modelKey(auth), signal),
+    lookupGroup(auth.access, modelKey(auth), signal).catch(error => {
+      if (signal?.aborted || error.signIn) throw error;
+      return null;
+    }),
   ]);
-  if (!Array.isArray(rows)) throw new Error("APIConnect 的订阅列表格式已变化。");
-  const active = rows.filter(row => row && (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now()));
+  const available = Array.isArray(rows);
+  const active = (available ? rows : []).filter(row => row && (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now()));
   const quota = subscriptionUsage(active, "APIConnect", group);
-  if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: "暂无有效订阅", aside: true });
+  for (const row of active.filter(row => groupIds(row).includes(group))) quota.windows.push(sharedPlan(row));
+  const groupStatus = !available ? "订阅列表暂不可查" : group === null ? "分组暂未核实，订阅仅供查看" : "已核对分组";
+  if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: available && group !== null ? "暂无有效订阅" : groupStatus, aside: true });
   if (Number.isFinite(user?.balance)) {
     quota.windows.push(wallet(user.balance));
   }
-  quota.windows.push({ name: "接入诊断", display: diagnostic("官网账号", undefined, "已核对分组"), aside: true });
+  quota.windows.push({ name: "接入诊断", display: diagnostic("官网账号", auth.modelCount, groupStatus), aside: true });
   return quota;
 }
 
@@ -220,10 +271,25 @@ export default async function apiConnectProvider(input) {
       async models(info, { auth, signal } = {}) {
         if (!auth) return {};
         const models = await listModels(auth, signal);
-        return Object.fromEntries(models.map(({ id, display_name }) => [id, {
-          ...info.models?.[id], id, name: display_name || info.models?.[id]?.name || id,
-          api: { id, url: modelBase, npm: anthropic },
-        }]));
+        const result = Object.create(null);
+        const aliases = Object.create(null);
+        const line = auth.line ?? auth.metadata?.line;
+        const plan = auth.planLabel ?? auth.metadata?.planLabel;
+        const upstreamIds = new Set(models.map(model => model.id));
+        for (const { id, display_name, supported_endpoint_types: endpoints } of models) {
+          const messages = !Array.isArray(endpoints) || endpoints.includes("messages");
+          const model = {
+            ...info.models?.[id], id, name: display_name || info.models?.[id]?.name || id,
+            api: { id, url: modelBase, npm: messages ? anthropic : responses },
+            also: messages && endpoints?.includes("responses") ? [responses] : [],
+          };
+          result[id] = model;
+          if (line && (auth.namedLine ?? auth.metadata?.namedLine)) {
+            const alias = id + "--line-" + fingerprint(line);
+            if (!upstreamIds.has(alias)) aliases[alias] = { ...model, id: alias, name: [model.name, line, plan].filter(Boolean).join(" · ") };
+          }
+        }
+        return { ...result, ...aliases };
       },
     },
     auth: {
@@ -231,21 +297,21 @@ export default async function apiConnectProvider(input) {
         return { baseURL: modelBase, apiKey: "unused", fetch: (input, init) => sendModel(input, init, getAuth) };
       },
       provider,
-      single: true,
       methods: [
         {
           type: "api", label: "API Key（充值或套餐）",
-          prompts: [{ type: "password", key: "subscriptionKey", message: "APIConnect API Key" }],
+          prompts: [{ type: "password", key: "subscriptionKey", message: "APIConnect API Key" }, linePrompt],
           async authorize(inputs, { signal } = {}) {
             try {
               const key = inputs.subscriptionKey?.trim();
               if (!key) throw new Error("请填写 API Key。");
+              const line = lineName(inputs, key);
               const auth = { type: "api", key };
               const models = await listModels(auth, signal);
               const quota = await readQuota(auth, signal);
               const message = "发现 " + models.length + " 个模型。额度类型：" + quota.plan + "。请在供应商中重新获取并勾选模型。";
               await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
-              return { type: "success", key, metadata: { email: "APIConnect Key", modelCount: models.length } };
+              return { type: "success", key, metadata: { email: line, line, namedLine: !!inputs.line?.trim(), modelCount: models.length, planLabel: quota.plan } };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
@@ -257,21 +323,31 @@ export default async function apiConnectProvider(input) {
             { type: "password", key: "modelKey", message: "同一账号的套餐分组 API Key" },
             { type: "text", key: "email", message: "APIConnect 登录邮箱" },
             { type: "password", key: "password", message: "APIConnect 登录密码" },
+            linePrompt,
           ],
           async authorize(inputs, { signal } = {}) {
             try {
               const key = inputs.modelKey?.trim();
               if (!key) throw new Error("请填写同一账号的套餐分组 API Key。");
+              const line = lineName(inputs, key);
               const email = inputs.email?.trim();
               if (!email || !inputs.password) throw new Error("请填写 APIConnect 登录邮箱和密码。");
               const data = await request("/api/v1/auth/login", { body: { email, password: inputs.password }, signal });
               const tokens = session(data);
               const group = await lookupGroup(tokens.access, key, signal);
               const plans = await request("/api/v1/subscriptions/active", { bearer: tokens.access, signal });
-              if (!Array.isArray(plans) || !plans.some(row => row && groupIds(row).includes(group))) {
+              const plan = Array.isArray(plans) && plans.find(row => row && groupIds(row).includes(group));
+              if (!plan) {
                 throw new Error("请填写此账号有效订阅分组里的 API Key。");
               }
-              return { type: "success", ...tokens, modelKey: key, groupId: group, accountId: data.user?.email || email };
+              const planLabel = plan.group_names?.join(" / ") || plan.group?.name || "订阅";
+              const listed = await listModels({ type: "api", key }, signal).catch(error => {
+                if (signal?.aborted || error.signIn) throw error;
+                return null;
+              });
+              const message = (listed ? "发现 " + listed.length + " 个模型" : "模型列表暂不可查") + "，已绑定订阅分组。请在供应商中重新获取并勾选模型。";
+              await input?.client?.tui?.showToast?.({ body: { message, variant: "info" } });
+              return { type: "success", ...tokens, modelKey: key, groupId: group, line, namedLine: !!inputs.line?.trim(), planLabel, accountId: line, modelCount: listed?.length };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
@@ -279,7 +355,7 @@ export default async function apiConnectProvider(input) {
         },
       ],
       async refresh(auth) {
-        return session(await request("/api/v1/auth/refresh", { body: { refresh_token: auth.refresh } }));
+        return session(await request("/api/v1/auth/refresh", { body: { refresh_token: auth.refresh }, signal: AbortSignal.timeout(15000) }), auth.refresh);
       },
       async usage(getAuth, _provider, { signal } = {}) {
         try {
