@@ -18,11 +18,15 @@ async function request(path, { bearer, body, signal } = {}) {
       redirect: "error",
       signal,
     });
-  } catch {
+  } catch (cause) {
+    if (signal?.aborted) throw cause;
     throw new Error("无法连接 APIConnect，请检查网络后重试。");
   }
   if (!response.ok) {
-    const error = new Error("APIConnect 返回 HTTP " + response.status + "。");
+    const status = response.status;
+    const subject = path.startsWith("/v1/") ? "模型 Key" : path.endsWith("/login") ? "邮箱或密码" : "官网会话";
+    const hint = { 401: subject + "无效，请重新验证。", 403: "当前凭据无权访问，请检查分组和权限。", 429: "请求过于频繁，请稍后重试。" };
+    const error = new Error("APIConnect HTTP " + status + "，" + (hint[status] || "服务暂不可用，请稍后重试。"));
     if (response.status === 401) error.signIn = "expired";
     throw error;
   }
@@ -35,22 +39,28 @@ async function request(path, { bearer, body, signal } = {}) {
 }
 
 function session(data) {
-  if (data?.requires_2fa) throw new Error("该账号需要网页二次验证，请改用套餐 Key 登录。");
+  if (data?.requires_2fa) throw new Error("该账号启用了二次验证。请在官网「我的订阅 → 查看可使用套餐的 Key」选择可直接查询订阅的 Key。");
   if (!data?.access_token || !data.refresh_token || !(data.expires_in > 0)) {
     throw new Error("APIConnect 未返回可续期的登录信息。");
   }
   return { access: data.access_token, refresh: data.refresh_token, expires: Date.now() + data.expires_in * 1000 };
 }
 
-function subscriptionUsage(records, fallbackName = "APIConnect 订阅") {
-  if (!records.length) throw new Error("这个账号没有有效订阅。");
+function groupIds(row) {
+  return [row.group_id, row.group?.id, ...(Array.isArray(row.group_ids) ? row.group_ids : [])]
+    .filter(id => typeof id === "string" && id.trim() || Number.isSafeInteger(id)).map(String);
+}
+
+function subscriptionUsage(records, fallbackName = "APIConnect 订阅", boundGroup) {
   const windows = [];
   const names = [];
   for (const row of records) {
     const limits = row.group ?? row;
     const name = row.group_names?.join(" / ") || limits.name || fallbackName;
     names.push(name);
-    const prefix = records.length > 1 ? name + " · " : "";
+    const aside = boundGroup !== undefined && !groupIds(row).includes(boundGroup);
+    const prefix = (aside ? "其他订阅 · " : "") + (records.length > 1 || aside ? name + " · " : "");
+    const before = windows.length;
     const termDays = Number(row.quota_period_days);
     for (const [period, label, days] of [
       ["daily", "每日", null], ["weekly", "每周", 7], ["monthly", "本期", termDays || null],
@@ -58,8 +68,11 @@ function subscriptionUsage(records, fallbackName = "APIConnect 订阅") {
       const limit = limits[period + "_limit_usd"];
       if (!Number.isFinite(limit) || limit <= 0) continue;
       const amount = row[period + "_usage_usd"];
-      if (!Number.isFinite(amount) || amount < 0) throw new Error("APIConnect 未返回完整的订阅用量。");
-      const window = { name: prefix + label, used: 100 * amount / limit, amount, limit, unit: "USD" };
+      if (!Number.isFinite(amount) || amount < 0) {
+        windows.push({ name: prefix + label, display: "本次未取得用量", aside: true });
+        continue;
+      }
+      const window = { name: prefix + label, used: 100 * amount / limit, amount, limit, unit: "USD", aside };
       const start = Date.parse(row[period + "_window_start"]);
       const end = Date.parse(row.expires_at);
       const reportedReset = Date.parse(row[period + "_reset_at"]);
@@ -70,9 +83,10 @@ function subscriptionUsage(records, fallbackName = "APIConnect 订阅") {
       }
       windows.push(window);
     }
+    if (before === windows.length) windows.push({ name, display: "暂无订阅额度明细", aside: true });
   }
-  if (!windows.length) throw new Error("APIConnect 未返回订阅额度。");
-  return { plan: names.join("；"), windows, ...(records.length === 1 && records[0].expires_at ? { until: records[0].expires_at } : {}) };
+  const current = boundGroup === undefined ? records : records.filter(row => groupIds(row).includes(boundGroup));
+  return { plan: names.join("；") || fallbackName, windows, ...(current.length === 1 && current[0].expires_at ? { until: current[0].expires_at } : {}) };
 }
 
 function modelKey(auth) {
@@ -87,16 +101,16 @@ async function listModels(auth, signal) {
   return result.data.filter(model => typeof model?.id === "string" && /^[\w.-]+$/.test(model.id));
 }
 
-async function checkPair(access, key, signal) {
-  // Match the exact key to this dashboard account and its active subscription groups.
-  const plans = await request("/api/v1/subscriptions/active", { bearer: access, signal });
-  const groups = new Set(plans.flatMap(row => [row.group_id, ...(row.group_ids ?? [])]));
+async function lookupGroup(access, key, signal) {
   for (let page = 1; ; page++) {
     const result = await request("/api/v1/keys?page_size=100&page=" + page, { bearer: access, signal });
     const rows = result?.items;
     if (!Array.isArray(rows)) throw new Error("无法核对 API Key 的订阅分组。");
     const match = rows.find(row => row.key === key);
-    if (match && match.status === "active" && groups.has(match.group_id)) return;
+    if (match?.status === "active") {
+      const [group] = groupIds(match);
+      if (group !== undefined) return group;
+    }
     if (match || rows.length < 100 || page * 100 >= result.total) break;
   }
   throw new Error("请填写此账号有效订阅分组里的 API Key。");
@@ -119,19 +133,22 @@ async function sendModel(input, init, getAuth) {
 async function readQuota(auth, signal) {
   if (auth.type === "api") {
     const data = await request("/v1/usage", { bearer: auth.key, signal });
-    if (!data?.subscription) throw new Error("这个 Key 只返回钱包或 Key 自身的额度。请选择「官网账号」读取我的订阅。");
-    if (data.isValid === false || Date.parse(data.subscription.expires_at) <= Date.now()) {
+    if (data?.isValid === false || Date.parse(data?.subscription?.expires_at) <= Date.now()) {
       throw new Error("APIConnect 报告套餐或 Key 已失效。");
     }
+    if (!data?.subscription) throw new Error("此 Key 无订阅明细。请从官网「我的订阅 → 查看可使用套餐的 Key」选择能直接查询订阅的 Key。");
     return subscriptionUsage([data.subscription], data.planName);
   }
   const opts = { bearer: auth.access, signal };
-  const [rows, user] = await Promise.all([
+  const [rows, user, group] = await Promise.all([
     request("/api/v1/subscriptions", opts),
     request("/api/v1/auth/me", opts).catch(() => null),
+    lookupGroup(auth.access, modelKey(auth), signal),
   ]);
   if (!Array.isArray(rows)) throw new Error("APIConnect 的订阅列表格式已变化。");
-  const quota = subscriptionUsage(rows.filter(row => (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now())));
+  const active = rows.filter(row => row && (!row.status || row.status === "active") && !(Date.parse(row.expires_at) <= Date.now()));
+  const quota = subscriptionUsage(active, "APIConnect", group);
+  if (!active.some(row => groupIds(row).includes(group))) quota.windows.unshift({ name: "当前分组", display: "暂无有效订阅", aside: true });
   if (Number.isFinite(user?.balance)) {
     quota.windows.push({ name: "钱包余额", display: "$" + user.balance.toFixed(2), aside: true });
   }
@@ -177,8 +194,12 @@ export default async function apiConnectProvider() {
               if (!email || !inputs.password) throw new Error("请填写 APIConnect 登录邮箱和密码。");
               const data = await request("/api/v1/auth/login", { body: { email, password: inputs.password }, signal });
               const tokens = session(data);
-              await checkPair(tokens.access, key, signal);
-              return { type: "success", ...tokens, modelKey: key, accountId: data.user?.email || email };
+              const group = await lookupGroup(tokens.access, key, signal);
+              const plans = await request("/api/v1/subscriptions/active", { bearer: tokens.access, signal });
+              if (!Array.isArray(plans) || !plans.some(row => row && groupIds(row).includes(group))) {
+                throw new Error("请填写此账号有效订阅分组里的 API Key。");
+              }
+              return { type: "success", ...tokens, modelKey: key, groupId: group, accountId: data.user?.email || email };
             } catch (error) {
               return { type: "failed", error: error.message };
             }
